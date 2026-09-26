@@ -1,0 +1,4 @@
+node_modules/
+*.tmp
+*.tgz
+info_collection_*.md

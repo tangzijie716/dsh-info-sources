@@ -1,0 +1,55 @@
+{
+  "name": "dsh-info-sources",
+  "version": "0.1.0",
+  "description": "信息采集插件 for DeepSeek Harness：采集方式做成适配器 + 接口地址做成独立清单。已实现 api-get（JSON 接口）与 rss（RSS/Atom，零依赖自带解析器）。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "config",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/run.mjs",
+    "test:resolve": "node test/bundle-resolution.mjs",
+    "dev:link": "node scripts/link-dsh-tools.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "info",
+    "collector",
+    "rss",
+    "atom",
+    "api"
+  ],
+  "license": "MIT",
+  "author": "TZJ",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tangzijie716/dsh-info-sources.git"
+  },
+  "homepage": "https://github.com/tangzijie716/dsh-info-sources#readme",
+  "bugs": {
+    "url": "https://github.com/tangzijie716/dsh-info-sources/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

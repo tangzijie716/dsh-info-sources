@@ -1,0 +1,4 @@
+# dsh-info-sources bundle — 挂载信息采集插件
+- insert:
+    - id: info-sources
+      name: 'dsh-info-sources'

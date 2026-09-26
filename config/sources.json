@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "_comment": "信息采集源清单（包内默认层 / 示例）。只放一个 api-get 与一个 rss 作为写法学样例，真实使用时请把它们换成你自己的源，或写进用户覆盖层（$DSH_INFO_SOURCES → $DSH_HOME/info-sources.json），后者不会被升级覆盖。以 _ 开头的键一律当注释忽略；想在清单里「注释掉」而不删除某个源，把它整段移进顶层 _disabled 数组即可。",
+  "_schema": {
+    "source": {
+      "id": "唯一标识，工具用 info_fetch(id=...) 引用",
+      "label": "人读名称",
+      "method": "采集方式，对应 lib/methods/ 下的适配器；当前为 api-get",
+      "enabled": "false 时不参与 info_collect，默认 true",
+      "tags": "自由标签，info_collect 可按 tag 选择一组源",
+      "url": "接口地址（api-get 必填）；支持 {key} 路径参数，值由调用时的 params 提供",
+      "query": "查询参数对象，会合并进 URL 的 search 部分",
+      "headers": "请求头对象，值支持 $ENV:NAME（必填）与 $ENV:NAME?（缺失则丢弃该请求头）",
+      "select": "字段映射：items（取值路径）/ itemsFallback（备用路径，主路径取空时依次尝试）/ title / hot / url / originalUrl / origin / publishedAt / summary / rank / label",
+      "limit": "单个源最多保留多少条，0 或缺省沿用 defaults.limit",
+      "timeoutMs": "单次请求超时毫秒数，缺省沿用 defaults.timeoutMs",
+      "note": "维护备注，原样展示在 info_sources 里"
+    }
+  },
+  "defaults": {
+    "method": "api-get",
+    "timeoutMs": 15000,
+    "limit": 20,
+    "headers": {
+      "Accept": "application/json, text/plain, */*"
+    }
+  },
+  "sources": [
+    {
+      "id": "aihot-daily",
+      "label": "AIHOT 日报",
+      "method": "api-get",
+      "tags": [
+        "ai",
+        "daily"
+      ],
+      "url": "https://aihot.news/api/v1/dailies/latest",
+      "select": {
+        "items": "report.sections[].items[]",
+        "title": "title",
+        "summary": "summary",
+        "origin": "source.name",
+        "url": "links.aihot",
+        "originalUrl": "links.original"
+      },
+      "limit": 20,
+      "note": "最新日报（每天 08:00 北京时间生成，条目按 sections 分组）。要取指定日期：复制这条，url 改成 https://aihot.news/api/v1/dailies/{date}，调用时 params={\"date\":\"2026-09-25\"}。"
+    },
+    {
+      "id": "qbitai-feed",
+      "label": "量子位",
+      "method": "rss",
+      "tags": [
+        "ai",
+        "cn",
+        "media"
+      ],
+      "url": "https://www.qbitai.com/feed",
+      "headers": {
+        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*"
+      },
+      "limit": 20,
+      "note": "AI 垂直媒体，原生 WordPress feed（/feed 与 /rss 等价），约 10 条，部分条目没有摘要。没走 RSSHub：rsshub.app 在本机 TCP 不通，公共镜像对该路由分别返回 503/502/404，而它自家就有 feed。"
+    }
+  ]
+}
