@@ -12,7 +12,7 @@
  * 从 npm/git 装进 profile 的包不需要这一步：它的物理位置就在
  * <profile>/node_modules 下，向上就能找到锚点。
  */
-import { existsSync, mkdirSync, symlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,9 +38,14 @@ const linkDir = join(packageRoot, "node_modules", "@deepseek-ai");
 const linkPath = join(linkDir, "dsh-tools");
 mkdirSync(linkDir, { recursive: true });
 
-if (existsSync(linkPath)) {
+if (existsSync(join(linkPath, "package.json"))) {
   console.log(`已存在，跳过：${linkPath}`);
 } else {
+  if (existsSync(linkPath)) {
+    const info = lstatSync(linkPath);
+    if (info.isDirectory() || info.isSymbolicLink()) rmSync(linkPath, { recursive: true, force: true });
+    else throw new Error(`目标路径已存在且不是目录：${linkPath}`);
+  }
   symlinkSync(target, linkPath, "junction");
   console.log(`已建立 junction：${linkPath}`);
 }

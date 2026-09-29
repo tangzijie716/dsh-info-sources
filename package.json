@@ -17,6 +17,7 @@
   ],
   "scripts": {
     "test": "node test/run.mjs",
+    "test:live": "node test/run.mjs --live",
     "test:resolve": "node test/bundle-resolution.mjs",
     "dev:link": "node scripts/link-dsh-tools.mjs"
   },

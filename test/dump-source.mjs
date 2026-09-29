@@ -44,10 +44,8 @@ writeFileSync(overridePath, `${JSON.stringify({
   _comment: "dump-source 临时覆盖层：只放开条数上限",
   sources: [{ id: sourceId, limit: 0 }],
 }, null, 2)}\n`, "utf8");
-process.env.DSH_INFO_SOURCES = overridePath;
-
 const result = await registered.get("info_fetch").execute(
-  { id: sourceId, path: outPath, limit: 0, ...extraArgs },
+  { id: sourceId, sourcesPath: overridePath, path: outPath, limit: 0, ...extraArgs },
   { signal: new AbortController().signal },
 );
 

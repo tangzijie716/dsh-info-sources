@@ -117,6 +117,7 @@ const server = createServer((req, res) => {
   const url = new URL(req.url, "http://127.0.0.1");
   if (url.pathname === "/nested") {
     lastRequest = { query: Object.fromEntries(url.searchParams), headers: req.headers };
+    const firstScore = url.searchParams.get("score") === "high" ? 99 : 11;
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({
       data: {
@@ -125,7 +126,7 @@ const server = createServer((req, res) => {
             items: [
               {
                 name: "甲",
-                score: 11,
+                score: firstScore,
                 desc: "甲的摘要",
                 from: { name: "来源甲" },
                 links: { original: "https://example.com/origin-a" },
@@ -219,6 +220,8 @@ writeFileSync(userPath, `${JSON.stringify({
     { id: "local-notfeed", label: "本地非 feed", method: "rss", url: `http://127.0.0.1:${port}/notafeed` },
     { id: "local-404", label: "本地 404", url: `http://127.0.0.1:${port}/missing`, select: { title: "x" } },
     { id: "local-badjson", label: "本地非 JSON", url: `http://127.0.0.1:${port}/badjson`, select: { title: "x" } },
+    { id: "dedupe-low", label: "去重低热度", url: `http://127.0.0.1:${port}/nested`, query: { score: "low" }, select: { items: "data.groups[].items[]", title: "name", hot: "score" }, limit: 1 },
+    { id: "dedupe-high", label: "去重高热度", url: `http://127.0.0.1:${port}/nested`, query: { score: "high" }, select: { items: "data.groups[].items[]", title: "name", hot: "score" }, limit: 1 },
     { id: "broken-method", label: "方式不存在", method: "no-such-method", url: "https://example.com", select: { title: "x" } },
     { id: "broken-url", label: "协议不对", url: "ftp://example.com", select: { title: "x" } },
     { id: "needs-env", label: "必填环境变量缺失", enabled: false, url: "https://example.com", headers: { Authorization: "$ENV:DEFINITELY_NOT_SET" }, select: { title: "x" } },
@@ -227,8 +230,6 @@ writeFileSync(userPath, `${JSON.stringify({
     { id: "parked-source", label: "被注释掉的测试源", method: "rss", url: "https://example.com/feed" },
   ],
 }, null, 2)}\n`, "utf8");
-process.env.DSH_INFO_SOURCES = userPath;
-
 // 测试期间的落盘一律进临时目录，别往工作区丢文件
 const outDir = join(dir, "collections");
 process.env.DSH_INFO_OUTPUT_DIR = outDir;
@@ -251,13 +252,13 @@ for (const name of toolNames) {
 
 const call = async (name, args) => {
   const tool = registered.get(name);
-  return await tool.execute(args, { signal: new AbortController().signal });
+  return await tool.execute({ sourcesPath: userPath, ...args }, { signal: new AbortController().signal });
 };
 
 /** 带会话上下文的调用：exec.agent.session.header.cwd 就是会话工作区 */
 const callAs = async (name, args, sessionCwd) => {
   const tool = registered.get(name);
-  return await tool.execute(args, {
+  return await tool.execute({ sourcesPath: userPath, ...args }, {
     signal: new AbortController().signal,
     agent: { session: { header: { cwd: sessionCwd } } },
   });
@@ -268,6 +269,8 @@ const rendered = (name, args, value) => registered.get(name).output.render(args,
 section("D. 清单校验（问题要报出来，而不是静默忽略）");
 const reloaded = await call("info_reload", {});
 const issueOf = (id) => reloaded.issues.filter((issue) => issue.id === id);
+const builtinOnly = await registered.get("info_reload").execute({}, { signal: new AbortController().signal });
+check("未传 sourcesPath 时只使用包内默认源", builtinOnly.total === 2 && builtinOnly.userExists === false && builtinOnly.user === undefined, JSON.stringify(builtinOnly));
 check("unknown method 被报错", issueOf("broken-method").some((issue) => issue.level === "error" && issue.message.includes("no-such-method")));
 check("非 http url 被报错", issueOf("broken-url").some((issue) => issue.level === "error" && issue.message.includes("http")));
 check("必填环境变量缺失被报错", issueOf("needs-env").some((issue) => issue.level === "error" && issue.message.includes("DEFINITELY_NOT_SET")));
@@ -286,7 +289,7 @@ const listedAll = await call("info_sources", { includeDisabled: true });
 check("覆盖层里的 _disabled 不被解析成源", !listedAll.sources.some((source) => source.id === "parked-source"), listedAll.sources.map((s) => s.id).join(", "));
 check("info_sources 报出被注释的源", listedAll.commentedOut.join(",") === "parked-source", JSON.stringify(listedAll.commentedOut));
 check("被注释的源也确实取不到", (await call("info_fetch", { id: "parked-source", save: false })).error.includes("清单里没有 id"));
-check("清单总数 = 包内两例 + 覆盖层 11 源", reloaded.total === builtinIds.length + 11, `total=${reloaded.total} 期望=${builtinIds.length + 11}`);
+check("清单总数 = 包内两例 + 覆盖层 13 源", reloaded.total === builtinIds.length + 13, `total=${reloaded.total} 期望=${builtinIds.length + 13}`);
 check("两种采集方式都已注册", listedAll.methods.map((method) => method.id).join(",") === "api-get,rss", listedAll.methods.map((method) => method.id).join(","));
 check("包内两个示例都通过清单校验", listedAll.sources.filter((source) => builtinIds.includes(source.id)).every((source) => source.ok === true), JSON.stringify(listedAll.sources.filter((s) => builtinIds.includes(s.id)).map((s) => [s.id, s.ok])));
 console.log(rendered("info_reload", {}, reloaded).split("\n").slice(0, 6).join("\n"));
@@ -332,6 +335,11 @@ const unknown = await call("info_fetch", { id: "no-such-source" });
 check("未知 id → 列出可用 id", unknown.ok === false && unknown.error.includes("可用："), unknown.error);
 const collectFail = await call("info_collect", { ids: "local-nested,local-404" });
 check("多源：部分失败仍返回成功源的数据", collectFail.results.length === 2 && collectFail.total === 2 && collectFail.ok === false);
+check("多源：保留各源请求 URL 与 HTTP 状态", collectFail.results.every((entry) => typeof entry.url === "string" && typeof entry.status === "number"), JSON.stringify(collectFail.results));
+const invalidSource = await call("info_fetch", { id: "needs-env", save: false });
+check("配置校验失败的源不会进入适配器", invalidSource.ok === false && invalidSource.error.includes("配置校验未通过"), invalidSource.error);
+const deduped = await call("info_collect", { ids: "dedupe-low,dedupe-high", dedupe: "title", save: false });
+check("高热度条目替换后 alsoFrom 指向旧来源而非自己", deduped.items[0]?.sourceId === "dedupe-high" && JSON.stringify(deduped.items[0]?.alsoFrom) === JSON.stringify(["dedupe-low"]), JSON.stringify(deduped.items[0]));
 const collectNone = await call("info_collect", { ids: "nope" });
 check("多源：无匹配源给出提示", collectNone.ok === false && collectNone.note.includes("没有匹配的源"), collectNone.note);
 const collectAi = await call("info_collect", { tag: "ai" });
@@ -356,7 +364,7 @@ const afterDisable = await call("info_sources", { includeDisabled: true });
 const disabledDaily = afterDisable.sources.find((source) => source.id === "aihot-daily");
 check("包内源被覆盖层停用", disabledDaily?.enabled === false && disabledDaily?.origin === "user", JSON.stringify(disabledDaily));
 check("覆盖字段被记录", JSON.stringify(disabledDaily?.overrides) === JSON.stringify(["enabled"]), JSON.stringify(disabledDaily?.overrides));
-check("文件里其它条目未被破坏", JSON.parse(readFileSync(userPath, "utf8")).sources.length === 12, String(JSON.parse(readFileSync(userPath, "utf8")).sources.length));
+check("文件里其它条目未被破坏", JSON.parse(readFileSync(userPath, "utf8")).sources.length === 14, String(JSON.parse(readFileSync(userPath, "utf8")).sources.length));
 const removed = await call("info_source_save", { id: "aihot-daily", remove: true });
 const afterRemove = await call("info_sources", {});
 const restoredDaily = afterRemove.sources.find((source) => source.id === "aihot-daily");
@@ -364,20 +372,23 @@ check("删除覆盖条目后回到默认层", removed.action === "remove" && res
 
 // ── E. 真接口冒烟 ─────────────────────────────────────────────────────────
 section("E. 真接口冒烟");
-const dailyLive = await call("info_fetch", { id: "aihot-daily", limit: 3 });
-softCheck("日报可取数", dailyLive.ok === true && dailyLive.count === 3, dailyLive.error);
-if (dailyLive.ok) {
-  softCheck("日报带摘要", dailyLive.items.every((item) => typeof item.summary === "string" && item.summary.length > 0));
-  softCheck("日报带原文链接与出处", dailyLive.items.every((item) => item.originalUrl !== undefined && item.origin !== undefined));
-  console.log(rendered("info_fetch", { id: "aihot-daily", limit: 3 }, dailyLive));
+if (process.argv.includes("--live")) {
+  const dailyLive = await call("info_fetch", { id: "aihot-daily", limit: 3 });
+  softCheck("日报可取数", dailyLive.ok === true && dailyLive.count === 3, dailyLive.error);
+  if (dailyLive.ok) {
+    softCheck("日报带摘要", dailyLive.items.every((item) => typeof item.summary === "string" && item.summary.length > 0));
+    softCheck("日报带原文链接与出处", dailyLive.items.every((item) => item.originalUrl !== undefined && item.origin !== undefined));
+    console.log(rendered("info_fetch", { id: "aihot-daily", limit: 3 }, dailyLive));
+  }
+  const qbitai = await call("info_fetch", { id: "qbitai-feed", limit: 5 });
+  softCheck("RSS 源（量子位）可取数", qbitai.ok === true && qbitai.count === 5, qbitai.error);
+  if (qbitai.ok) console.log(rendered("info_fetch", { id: "qbitai-feed", limit: 5 }, qbitai));
+  const live = await call("info_collect", { tag: "ai", limit: 10 });
+  softCheck("多源汇总可取数", live.total > 0, live.note ?? live.results.map((entry) => entry.error).join(" | "));
+  if (live.total > 0) console.log(rendered("info_collect", { tag: "ai" }, live));
+} else {
+  console.log("  – 已跳过；用 npm run test:live 执行");
 }
-const qbitai = await call("info_fetch", { id: "qbitai-feed", limit: 5 });
-softCheck("RSS 源（量子位）可取数", qbitai.ok === true && qbitai.count === 5, qbitai.error);
-if (qbitai.ok) console.log(rendered("info_fetch", { id: "qbitai-feed", limit: 5 }, qbitai));
-
-const live = await call("info_collect", { tag: "ai", limit: 10 });
-softCheck("多源汇总可取数", live.total > 0, live.note ?? live.results.map((entry) => entry.error).join(" | "));
-if (live.total > 0) console.log(rendered("info_collect", { tag: "ai" }, live));
 
 const listed = await call("info_sources", { includeDisabled: true });
 console.log(`\n${rendered("info_sources", { includeDisabled: true }, listed)}`);

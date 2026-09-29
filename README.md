@@ -1,409 +1,488 @@
 # dsh-info-sources
 
-信息采集插件 for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）。
+`dsh-info-sources` 是一个面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的信息采集插件。它将采集方式封装为适配器，将信息源保存为 JSON 清单，并把不同来源的数据归一化为统一结构。
 
-一句话：**采集方式做成适配器，接口地址做成清单**。加一个信息来源 = 改一份 JSON；加一种采集方式 = 加一个适配器文件。
-已实现两种采集方式：
+## 功能特性
 
-- `api-get` —— HTTP GET 一个 JSON 接口，用 `select` 把任意结构映射成统一条目；
-- `rss` —— GET 一个 RSS 2.0 / Atom / RSS 1.0(RDF) 订阅源，按固定映射归一化（**零依赖**，自带解析器）。
+- `api-get`：请求 JSON API，并通过字段路径映射数据；
+- `rss`：解析 RSS 2.0、Atom 和 RSS 1.0/RDF；
+- 多源并行采集、按标题去重、按热度排序；
+- 包内默认源与显式用户覆盖层；
+- 配置校验、环境变量插值和文件热重载；
+- 默认生成 Markdown 采集报告；
+- HTTP、解析和单源失败均返回结构化结果。
 
-取到的条目统一归一化为
-`{ sourceId, title, rank, hot?, url?, originalUrl?, origin?, publishedAt?, summary?, label? }`，
-并且**默认落盘**成一份 markdown（`info_collection_<时间戳>.md`），方便后续写作、归档与人工复核。
+## 运行要求
 
-## 清单分两层，包内只带两个示例
-
-| 层 | 文件 | 内容 |
-|---|---|---|
-| 包内默认层（随包发布） | `config/sources.json` | 只有 **`aihot-daily`**（api-get）与 **`qbitai-feed`**（rss）两个示例，用来说明「一个 JSON 接口」和「一个订阅源」各怎么写 |
-| 用户覆盖层（本机） | `$DSH_INFO_SOURCES` → `$DSH_HOME/info-sources.json` → `~/.dsh/info-sources.json` | 你真正在用的源放这里：按 id 覆盖包内条目、或追加新源；**升级插件不会冲掉它** |
-
-示例两条都指向公开可用的源，装上就能跑：
-
-- `aihot-daily` → AIHOT 日报（`GET https://aihot.news/api/v1/dailies/latest`，演示嵌套数组路径 `report.sections[].items[]` 与摘要/出处/双链接的映射）；
-- `qbitai-feed` → 量子位（`https://www.qbitai.com/feed`，WordPress 原生 RSS，演示 rss 方式只要一个 url）。
-
-> 想让包内清单也带上自己的源，就往 `config/sources.json` 的 `sources` 里加；但更推荐写进**覆盖层**——包内那份会被插件升级覆盖，覆盖层不会。
-> 想在清单里「注释掉」一个源而不删除，把它整段移进顶层的 `_disabled` 数组即可（`_` 开头的键不参与解析、不校验、不采集，条目原样留在文件里，`info_sources` 会列出它们）。
-> 注意 `_disabled` 只对**本层**有效：想停用包内的源，要在覆盖层的 `sources` 里写 `{ "id": "aihot-daily", "enabled": false }`。
-
-## 工具
-
-| 工具 | 作用 |
-|---|---|
-| `info_sources` | 列出清单里的源：id、采集方式、是否启用、接口地址、标签、校验问题，以及被注释掉的源有哪些 |
-| `info_fetch` | 按 id 抓**一个**源；`params` 追加/覆盖查询参数（也用于 `{key}` 路径参数），`limit` 覆盖条数上限；结果默认落盘 |
-| `info_collect` | 按 `ids` 或 `tag` **并行**抓多个源并汇总；`dedupe=title` 按标题合并、`sort=hot` 按热度排序；结果默认落盘 |
-| `info_reload` | 强制重读清单并回报全部校验问题（改完文件/环境变量后立刻确认） |
-| `info_source_save` | 用程序方式维护覆盖层：写入/更新/删除某个源的字段（如 `{"enabled": false}` 停用） |
-
-典型用法（id 用包内示例；你自己的源放进覆盖层后换成自己的 id，`info_sources` 会列出全部可用 id）：
-
-```
-info_fetch(id="aihot-daily", limit=10)
-info_fetch(id="qbitai-feed", limit=10)                                       # RSS 订阅源
-info_fetch(id="aihot-daily", params={"date":"2026-09-25"})                   # 指定日期（见下面日报说明）
-info_collect(tag="ai", dedupe="title", sort="hot", limit=20)                 # 全部 ai 标签源一起汇总去重
-info_fetch(id="aihot-daily", path="collections/ai")                          # 落盘到指定目录
-info_fetch(id="aihot-daily", path="draft/source.md")                         # 落盘到指定文件
-info_fetch(id="aihot-daily", save=false)                                     # 只看不落盘
-info_source_save(id="aihot-daily", patch={"enabled": false})                 # 停用某个源，改完自动重载
-```
-
-所有工具**抓取失败不抛异常**，而是返回 `ok=false` + 具体原因（HTTP 状态、超时、非 JSON、结构不匹配、未知 id…）；
-`info_collect` 里单个源失败不影响其它源的结果，失败原因写进结果的 `results` 与落盘文件的「来源」小节。
-
-## 采集结果落盘
-
-`info_fetch` / `info_collect` 默认把读出来的信息写成一份 markdown。
-
-- **文件名**：`info_collection_<YYYYMMDDHHmmss>.md`，时间戳是**北京时间**的抓取时刻，例如 `info_collection_20260926144749.md`。
-- **目录优先级**：`path` 参数 → 环境变量 `DSH_INFO_OUTPUT_DIR` → **会话工作区**（`exec.agent.session.header.cwd`，即 `./`）→ `process.cwd()` 兜底。
-- **注意**：默认目录是**会话工作区**，不是 dsh 进程的启动目录。harness 可以在任意目录启动（例如家目录），而会话工作区是会话级设置，两者常常不同；取值与内置 pwsh 工具的默认 workdir 同源。
-- **`path` 语义**：以 `.md` 结尾视为文件名（按调用方意图**覆盖**）；否则视为目录，在其下生成带时间戳的文件名；相对路径按**会话工作区**解析。
-- **`save=false`**：只返回结果不落盘。
-- **撞名处理**：自动生成的文件名从不覆盖已有文件，同一秒内多次采集会依次退让为 `_2`、`_3`…（并发下用 `wx` 独占创建保证不互相覆盖）。
-- **落盘失败不影响取数**：失败时结果里给 `fileError`，条目照常返回；成功时给 `file` 与 `fileBytes`，并在渲染文本第一行报出路径。
-- **不落盘的工具**：`info_sources` / `info_reload` / `info_source_save` 只涉及清单本身，不写文件。
-
-文件结构：
-
-```markdown
-# AIHOT 日报（aihot-daily）采集结果
-
-> 抓取时间：2026/09/26 17:33:49（北京时间）
-> 条目：15 条
-> 来源 id：`aihot-daily`　采集方式：`api-get`
-> 请求：https://aihot.news/api/v1/dailies/latest
-> 命中字段路径：`report.sections[].items[]`
-
-## 来源
-
-- ✓ **AIHOT 日报**（`aihot-daily`）：15 条
-  - 请求：https://aihot.news/api/v1/dailies/latest
-  - 命中字段路径：`report.sections[].items[]`
-
-## 条目（15 条）
-
-### 01. Satya Nadella 宣布 Copilot 迄今最大更新，定位为工作新 OS
-
-**名次**：1 ｜ **热度**：67 ｜ **分类**：ai-products
-
-- **出处**：X：Satya Nadella (@satyanadella)
-- **发布**：2026-09-25T12:05:00.000Z（北京时间 09-25 20:05）
-- **原文**：https://x.com/satyanadella/status/2103455884366188544
-- **站内**：https://aihot.news/items/cmugxabb31gj8rogv0mand702
-
-**摘要**：Satya Nadella 宣布 Copilot 迄今最大更新，将其定位为覆盖每个模型、设备和任务的工作新 OS。
-```
-
-## 示例一：api-get 方式（AIHOT 日报）
-
-包内自带 `aihot-daily` → `GET https://aihot.news/api/v1/dailies/latest`，用它演示
-`select` 的嵌套数组路径（`report.sections[].items[]`）以及摘要 / 出处 / 原文链接 / 站内链接的映射写法。
-
-AIHOT 是匿名只读、**无需 API Key** 的 AI 资讯站；字段与错误码以官方 [OpenAPI 3.1](https://aihot.news/openapi-v1.json) 为准。
-它还有另外两个端点，需要时按同样写法加进清单：
-
-| 端点 | 说明 |
-|---|---|
-| `GET /api/v1/items` | 精选（`mode=selected&window=24h`；`category` 可选 ai-models / ai-products / industry / paper / tip） |
-| `GET /api/v1/hot-topics` | 当前热点榜，已跨信源聚合成同一事件，带 `rank` |
-| `GET /api/v1/dailies/latest` | 最新日报（每天 08:00 北京时间），条目取自 `report.sections[].items[]` ← 包内示例 |
-
-`items` 可用参数（用 `params` 传）：`window=24h|7d`、`mode=all`（公开池）、
-`category=ai-models|ai-products|industry|paper|tip`、`q=关键词 2-200 字`、`limit=1..100`。
-
-**日报取指定日期**：`aihot-daily` 的 URL 是 `/dailies/latest`。复制这条源，把 url 改成
-`https://aihot.news/api/v1/dailies/{date}`，调用时 `params={"date":"2026-09-25"}` 即可（这就是 `{key}` 路径参数的用法）。
-
-**调用节奏与合规**（官方要求，值得遵守）：
-
-- 轮询间隔不要快于响应头的 `s-maxage`（items / hot-topics 都是 60 秒），更密只会拿到同一份缓存；
-- 建议用 `ETag` + `If-None-Match` 条件请求，304 表示没变化；收到 429 严格按 `Retry-After` 退避，不要加并发重试；
-- 内容里带 **AI 生成的摘要**：引用数字、政策或原话前必须用返回的**原文链接**复核（所以 `originalUrl` 单独映射）；
-- 许可：个人非商业、公益非商业、组织内部使用免费；面向外部的商业产品、收费服务、客户交付、代理接口、
-  数据转售、公开镜像或批量再分发**须先取得书面授权**，仅署名不构成授权。
-
-## 示例二：rss 方式（量子位）
-
-包内自带 `qbitai-feed` → `https://www.qbitai.com/feed`（AI 垂直媒体「量子位」的 WordPress 原生 feed，约 10 条，部分条目没有摘要）。
-
-> 挑源经验：优先找**原生 feed**，其次才考虑 RSSHub。量子位这条就是这么找到的——
-> `rsshub.app` 在部分网络下 TCP 直接不通，公共镜像对该路由又返回 503/502/404，而它自家就有 `/feed`。
-
-feed 不是 JSON，所以没有 `select` 字段映射，采用**固定映射**（`lib/methods/rss.js`）：
-
-| 统一字段 | 取自 | 说明 |
-|---|---|---|
-| `title` | `<title>` | 支持 CDATA |
-| `url` | `<link>` | Atom 取 `rel=alternate`（或无 `rel`）那条的 `href` |
-| `summary` | `<description>` → `<summary>` → `<content:encoded>` → `<content>` | 先解 XML 实体再剥 HTML 标签，压成一行，上限 2000 字 |
-| `origin` | `<author>` → `<category domain="source">` 的文本 → feed 标题 | `dc:creator`、Atom 的 `<author><name>` 都认 |
-| `publishedAt` | `<pubDate>` → `<published>` → `<updated>` → `<dc:date>` | 统一转 ISO 8601，渲染时再换算北京时间 |
-| `label` | 第一个不带 `domain` 属性的 `<category>` | Atom 取 `term` 属性 |
-| `hot` | — | feed 没有热度，不输出 |
-
-仍沿用清单的通用字段：`limit`、`timeoutMs`、`headers`、`query`、url 里的 `{key}` 路径参数。
-要加一个订阅源：复制 `qbitai-feed` 那条，改 `id` / `label` / `url` 即可（`method` 保持 `rss`）。
-
-解析器是**零依赖自研**的（`lib/feed.js`）：支持 RSS 2.0 / Atom / RSS 1.0(RDF)、CDATA、命名与数字实体、
-命名空间前缀（`media:`、`content:`、`dc:`）、自闭合标签、属性值里的 `>`；不做 DTD 与命名空间校验。
-刻意不引第三方 XML 库，理由和「不依赖别的插件」一样：不去共享别人 `node_modules` 里的传递依赖。
-
-## 清单怎么维护
-
-两层合并的顺序是：**包内默认层 → 用户覆盖层**，同 id 按字段覆盖，新 id 追加。
-
-- **同 id 覆盖**：只写 `{ "id": "aihot-daily", "enabled": false }` 就停用包内那条；写全 `id/url/select` 就是新增自定义源。
-- **热重载**：文件 mtime 一变，下次调用自动重读；也可以直接 `info_reload`。**代码**改动才需要重启 dsh。
-- **注释而不删除**：顶层 `_disabled` 数组（以 `_` 开头的键一律当注释忽略）。条目留在文件里可被审查/恢复，
-  但不参与校验、不参与采集，也不会出现在 `info_fetch` 的可用 id 里；`info_sources` 会单独列出它们。
-- **密钥不进代码**：字符串值支持 `$ENV:NAME`（必填，缺失即校验报错）与 `$ENV:NAME?`（可选，缺失就丢掉所在的请求头/参数）。
-  例如 `"Cookie": "$ENV:WEIBO_COOKIE?"`，设了环境变量就带上，没设就匿名请求。
-- **校验问题不静默**：未知 method、非 http 地址、缺必填环境变量、写错的字段名，都会出现在 `info_sources` / `info_reload` 的输出里。
-
-### 一个源条目长什么样
-
-JSON 接口（`api-get`）—— 地址、请求头、参数、字段映射全在清单里（下面是包内示例 `aihot-daily` 的实际内容）：
-
-```json
-{
-  "id": "aihot-daily",
-  "label": "AIHOT 日报",
-  "method": "api-get",
-  "tags": ["ai", "daily"],
-  "url": "https://aihot.news/api/v1/dailies/latest",
-  "select": {
-    "items": "report.sections[].items[]",
-    "title": "title",
-    "summary": "summary",
-    "origin": "source.name",
-    "url": "links.aihot",
-    "originalUrl": "links.original",
-    "label": "category",
-    "hot": "score",
-    "rank": "rank",
-    "publishedAt": "publishedAt"
-  },
-  "limit": 20,
-  "timeoutMs": 15000,
-  "note": "维护备注，会显示在 info_sources 里"
-}
-```
-
-> `select` 里的键都可选（`items` 与 `title` 必填）：源里没有的字段就不写，上面把可用字段列全只是为了当字典用。
-> `label` 会渲染成条目的分类，`hot` 参与 `sort=hot` 排序，`itemsFallback` 可在主路径取空时兜底结构变动。
-
-订阅源（`rss`）—— 只要地址，字段映射是固定的（见上面「示例二」的映射表）：
-
-```json
-{
-  "id": "qbitai-feed",
-  "label": "量子位",
-  "method": "rss",
-  "tags": ["ai", "cn", "media"],
-  "url": "https://www.qbitai.com/feed",
-  "headers": { "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*" },
-  "limit": 20,
-  "note": "维护备注"
-}
-```
-
-### `select` 路径语法
-
-| 写法 | 含义 |
-|---|---|
-| `a.b.c` | 逐级取属性 |
-| `a.b[]` | 取数组的每个元素，可串联：`report.sections[].items[]` |
-| `a.b[0]` | 取第 0 个元素 |
-| `itemsFallback` | 主路径取空时依次尝试的备用路径 —— 接口改结构时只改清单，不动代码 |
-
-`url` 里的 `{key}` 是路径参数占位符，值由调用时的 `params` 提供（缺值会得到明确报错，不会发出半截请求）。
-其余 `params` 并进查询串：清单 `query` 打底，调用时同名覆盖。
-
-### 三种维护方式
-
-1. 直接编辑覆盖层文件（`~/.dsh/info-sources.json`，人读友好，支持 `_` 注释键）
-2. 让模型调 `info_source_save`（程序化写入，自动重载，适合「换个地址试试」）
-3. `DSH_INFO_SOURCES=/path/to/my.json` 指向任意清单文件（多套清单切换，或随项目走）
-
-## 加一种采集方式
-
-采集方式的契约很小（见 `lib/methods/index.js`）：
-
-```js
-export const myMethod = {
-  id: "rss",
-  label: "RSS/Atom 订阅",
-  summary: "解析 XML 订阅源",
-  requiredKeys: ["url"],                 // 清单校验用（点号表示嵌套，如 "select.title"）
-  async run(source, { signal, params, defaults }) {
-    // 返回 { ok: true, status, url, items, rawCount } 或 { ok: false, status, url, error, items: [] }
-    // items 元素统一为 { sourceId, title, rank, hot?, url?, originalUrl?, origin?, publishedAt?, summary?, label? }
-  },
-};
-
-// lib/methods/index.js
-registerMethod(myMethod);
-```
-
-工具层（`lib/index.js`）与清单层都不用改：清单里把 `method` 写成新 id 即可。
-已实现：`api-get`、`rss`。预留方向：`html`（选择器抽列表/正文）、`api-post`（POST + body）。
-
-新适配器可以直接复用公共层：`lib/http.js`（UA 轮换、超时与取消、字符集嗅探、URL 组装）、
-`lib/source-util.js`（`limit` / `timeoutMs` / `headers` 三个通用字段的取值规则）、`lib/select.js`（取值路径）。
+- Node.js 20 或更高版本；
+- DeepSeek Harness；
+- 由 Harness 提供的 `@deepseek-ai/dsh-tools`。
 
 ## 安装
 
-```sh
-# 本地开发：link 当前目录（把 <path> 换成本包所在目录）
-dsh plugin --profile web add link:D:\WeChat-Publishing\dsh-info-sources
+建议固定到具体 Git 提交，以获得可复现的安装结果：
 
-# 或从 git 安装（建议 pin 到一个 commit，profile 的 lockfile 才可复现）
-dsh plugin --profile web add git+https://github.com/tangzijie716/dsh-info-sources.git
-```
-
-`dsh plugin` 会在 profile 目录里执行 pnpm，并把声明了 `dsh.bundle` 的依赖自动加进
-`dsh.profile.bundles`（见 `~/.dsh/profiles/web/package.json`）。改完需要重启 dsh 或新开会话后生效。
-
-> **`link:` 安装前先跑一次 `npm run dev:link`**：harness 只用 profile 目录解析插件的*入口*包名，
-> 插件内部的 `import "@deepseek-ai/dsh-tools"` 仍按真实路径向上找 node_modules；以 `link:` 安装时
-> 包的真实路径在 profile 之外，需要包内有一个指向 DSH 自带副本的 junction。
-> 从 npm/git 装进 profile 的包不需要这一步（物理位置就在 `<profile>/node_modules` 下）。
-
-## 发布
-
-前提：包是以 **bundle** 形式被 dsh 加载的——`package.json` 里的 `dsh.bundle.patch` 指向 `cordis.patch.yml`，
-`dsh plugin add` 会据此把它登记进 `dsh.profile.bundles`。所以发布就是把这份包放到别人能装的地方。
-
-### 0. 发布前自检（必做）
-
-```sh
-npm test                      # 断言矩阵：解析 / 清单 / 落盘 / 真接口冒烟
-npm run test:resolve          # 按 profile 解析路径加载并 apply(ctx)
-npm pack --dry-run            # 看清哪些文件会进包（不该有 node_modules / test / scripts）
-```
-
-关键一步是**验证打包产物在真实安装位置能跑**（不是 link，而是物理落在 `<profile>/node_modules/` 下）：
-`npm pack` 后解压到隔离 profile 的 `node_modules/dsh-info-sources/`，再让 dsh 组合一次配置并 `apply(ctx)`。
-
-### 1. 走 git（最省事，推荐）
-
-```sh
-cd dsh-info-sources
-git init && git add . && git commit -m "feat: dsh-info-sources v0.1.0"
-git branch -M main
-git remote add origin https://github.com/tangzijie716/dsh-info-sources.git
-git push -u origin main
-```
-
-别人（或你自己）安装：
-
-```sh
-dsh plugin --profile web add git+https://github.com/tangzijie716/dsh-info-sources.git
-# 想锁版本就带上 commit：
+```powershell
 dsh plugin --profile web add git+https://github.com/tangzijie716/dsh-info-sources.git#<commit>
 ```
 
-### 2. 走 npm（可选）
+跟随默认分支：
 
-未加 scope 的 `dsh-info-sources` 需要该名字在 npm 上没被占用；更稳的是用 scope：
-
-```sh
-npm publish --access public          # 若包名是 @tangzijie716/dsh-info-sources
-dsh plugin --profile web add @tangzijie716/dsh-info-sources
+```powershell
+dsh plugin --profile web add git+https://github.com/tangzijie716/dsh-info-sources.git
 ```
 
-### 3. 升级
+本地开发：
 
-改 `version` → 提交/推送（或 `npm publish`）→ 使用者：
-
-```sh
-dsh plugin --profile web add git+https://github.com/tangzijie716/dsh-info-sources.git#<new-commit>
+```powershell
+npm run dev:link
+dsh plugin --profile web add link:D:\path\to\dsh-info-sources
 ```
 
-`dsh plugin` 每次都会重新对齐 `dsh.profile.bundles`：依赖里有声明 `dsh.bundle` 的包自动加入，移除的自动摘掉。
+`npm run dev:link` 会建立指向 Harness 所带 `@deepseek-ai/dsh-tools` 的开发链接。通过 Git 或 npm 正常安装时通常不需要执行它。
 
-### 版本与兼容性提醒
+安装或升级后，请重启 DSH 或创建新会话。
 
-- `peerDependencies` 写的是 `@deepseek-ai/dsh-tools: "*"`，运行时由 harness 自己提供，不要把它做成 `dependencies`。
-- `engines.node >= 20`：适配器用了全局 `fetch`、`AbortController`、`TextDecoder`。
-- 使用者只需要安装**这一个包**；清单与代码都在包内，不需要额外的数据文件或服务。
+## 快速开始
 
-## 本地验证
+插件自带两个示例源：
 
-```sh
-npm test                     # 等价 node test/run.mjs
-npm run test:resolve         # 等价 node test/bundle-resolution.mjs
-npm run dev:link             # 建立本地 @deepseek-ai/dsh-tools 解析链接
-node test/try.mjs info_fetch # 手动试跑单个工具（配 $env:INFO_ARGS 传 JSON 入参）
+- `aihot-daily`：JSON API 示例；
+- `qbitai-feed`：RSS 示例。
+
+```text
+info_sources()
+info_fetch(id="aihot-daily", limit=10)
+info_fetch(id="qbitai-feed", limit=10)
+info_collect(tag="ai", dedupe="title", sort="hot", limit=20)
 ```
 
-`test/run.mjs` 不需要启动 harness：用假 ctx 拿到工具定义后直接调用。覆盖工具注册与 schema 编译、本地 HTTP 接口
-（字段映射含摘要/出处/原文/时间、`itemsFallback`、query 合并与覆盖、`{key}` 路径参数与缺值报错、可选 `$ENV` 请求头、
-limit、404、非 JSON、未知 id）、RSS/Atom/RDF 解析器单测与走 HTTP 的完整链路、覆盖层增删改、清单校验与
-`_disabled` 机制、落盘（时间戳/目录优先级含**会话工作区**/显式路径/撞名退让/`save=false`）、
-以及 AIHOT 日报与量子位真接口冒烟（网络不可用时只 WARN 不 FAIL）。
+### 使用用户覆盖层
 
-测试期间默认输出目录被指到临时目录（`DSH_INFO_OUTPUT_DIR`），不会往工作区丢文件。
+用户覆盖层没有默认路径。每次需要使用时，必须显式传入 `sourcesPath`：
 
-`test/check-feeds.mjs` 是**加源前的体检工具**：批量判断一批 RSS/Atom 地址能不能当源用。它走的就是插件的
-HTTP 层与解析器，所以「体检通过」等于「加成 rss 源后能取到东西」，并报出格式、条目数、字段完整度：
-
-```sh
-node test/check-feeds.mjs https://www.36kr.com/feed https://sspai.com/feed
+```text
+info_sources(sourcesPath="config/my-sources.json")
+info_fetch(id="my-source", sourcesPath="config/my-sources.json")
+info_collect(tag="news", sourcesPath="config/my-sources.json")
 ```
 
-> 用它的理由：同名站点不带 `www` 常常返回 SPA 的 HTML 而不是 feed（36氪 就是），这类坑只有真拉一次才看得出来。
+不传 `sourcesPath` 时，插件只使用包内的 `config/sources.json`，不会自动读取环境变量、用户目录或以前调用过的覆盖文件。相对路径以当前 DSH 会话工作区为基准。
 
-`test/dump-source.mjs` 把**任意一个源**整份导出成一份 markdown 快照（内部用临时覆盖层放开该源的条数上限，
-再用显式 `.md` 路径落盘）：
+## 源清单
 
-```sh
-node test/dump-source.mjs qbitai-feed "D:\WeChat-Publishing\量子位-全量.md"
+### 分层与合并
+
+| 层 | 位置 | 行为 |
+|---|---|---|
+| 包内默认层 | `config/sources.json` | 随插件发布，提供默认值和示例源 |
+| 用户覆盖层 | 调用参数 `sourcesPath` | 按 `id` 修改默认源或追加新源 |
+
+同一 `id` 同时存在于两层时，用户层字段覆盖默认层字段。
+
+### 配置示例
+
+```json
+{
+  "version": 1,
+  "defaults": {
+    "method": "api-get",
+    "timeoutMs": 15000,
+    "limit": 20,
+    "headers": {
+      "Accept": "application/json, text/plain, */*"
+    }
+  },
+  "sources": [
+    {
+      "id": "example-api",
+      "label": "示例接口",
+      "method": "api-get",
+      "enabled": true,
+      "tags": ["news", "example"],
+      "url": "https://example.com/api/items",
+      "query": {
+        "language": "zh-CN"
+      },
+      "headers": {
+        "Authorization": "Bearer $ENV:EXAMPLE_TOKEN"
+      },
+      "select": {
+        "items": "data.items[]",
+        "itemsFallback": ["items[]"],
+        "title": "title",
+        "hot": "score",
+        "url": "url",
+        "originalUrl": "originalUrl",
+        "origin": "source.name",
+        "publishedAt": "publishedAt",
+        "summary": "summary",
+        "label": "category"
+      },
+      "limit": 20,
+      "timeoutMs": 15000
+    },
+    {
+      "id": "example-feed",
+      "label": "示例订阅",
+      "method": "rss",
+      "tags": ["news"],
+      "url": "https://example.com/feed.xml",
+      "limit": 20
+    }
+  ]
+}
 ```
 
-`test/bundle-resolution.mjs` 从真实 profile 目录解析插件包名并 `apply(ctx)`，走的就是 harness 加载 bundle 的那条路径，
-用于确认「装上了」等于「挂载了且真的注册了工具」：
+### 通用字段
 
-```sh
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | string | 唯一源标识 |
+| `label` | string | 显示名称，缺省时使用 `id` |
+| `method` | string | `api-get` 或 `rss` |
+| `enabled` | boolean | 是否参与默认多源采集，默认 `true` |
+| `tags` | string[] | 筛选标签 |
+| `url` | string | HTTP/HTTPS 地址，可包含 `{key}` 占位符 |
+| `query` | object | 默认查询参数 |
+| `headers` | object | 请求头，支持环境变量插值 |
+| `limit` | number | 单源条数上限；`0` 表示不限制 |
+| `timeoutMs` | number | 请求超时毫秒数 |
+| `note` | string | 维护备注 |
+
+### 环境变量插值
+
+`url`、`query` 和 `headers` 中的字符串支持：
+
+```json
+{
+  "Authorization": "Bearer $ENV:API_TOKEN",
+  "X-Optional-Key": "$ENV:OPTIONAL_KEY?"
+}
+```
+
+- `$ENV:NAME`：必填。缺失时源配置校验失败，插件不会发送请求；
+- `$ENV:NAME?`：可选。缺失且字段值为空时删除对应字段并给出警告。
+
+不要把密钥直接写入清单或提交到 Git。
+
+### URL 参数
+
+URL 可以包含路径占位符：
+
+```json
+{ "url": "https://example.com/dailies/{date}" }
+```
+
+调用时通过 `params` 提供：
+
+```text
+info_fetch(
+  id="daily",
+  sourcesPath="config/my-sources.json",
+  params={"date":"2026-09-25"}
+)
+```
+
+没有用于路径占位符的其他 `params` 会加入查询字符串，并覆盖 `query` 中的同名字段。
+
+### `api-get` 字段映射
+
+`api-get` 至少需要 `url` 和 `select.title`。`select` 支持：
+
+- `items` 和 `itemsFallback`；
+- `title`、`rank`、`hot`；
+- `url`、`originalUrl`；
+- `origin`、`publishedAt`、`summary`、`label`。
+
+路径语法：
+
+| 写法 | 含义 |
+|---|---|
+| `data.items` | 逐级读取属性 |
+| `data.items[]` | 展开数组 |
+| `data.groups[].items[]` | 连续展开嵌套数组 |
+| `data.items[0]` | 读取指定下标 |
+
+标题为空的条目会被忽略。不能转换为有限数值的 `hot` 会被省略。
+
+### `rss` 字段映射
+
+`rss` 只要求提供 `url`，并使用固定映射：
+
+| 统一字段 | Feed 字段 |
+|---|---|
+| `title` | `title` |
+| `url` | `link`；Atom 优先 `rel=alternate` |
+| `summary` | `description`、`summary`、`content:encoded` 或 `content` |
+| `origin` | 作者、来源分类或 Feed 标题 |
+| `publishedAt` | `pubDate`、`published`、`updated` 或 `dc:date` |
+| `label` | 分类 |
+
+HTML 摘要会转换为单行纯文本，发布时间会尽可能转换为 ISO 8601。
+
+### 注释与停用
+
+以 `_` 或 `$` 开头的对象键会被忽略。需要保留但暂不解析的源可以放进顶层 `_disabled`：
+
+```json
+{
+  "version": 1,
+  "_disabled": [
+    {
+      "id": "future-source",
+      "method": "rss",
+      "url": "https://example.com/feed.xml"
+    }
+  ],
+  "sources": []
+}
+```
+
+要停用包内默认源，应在覆盖层 `sources` 中写入同一 `id` 和 `"enabled": false`。
+
+## 工具参考
+
+### `info_sources`
+
+列出源、采集方式、启用状态、标签和校验问题。
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `sourcesPath` | 否 | 本次使用的覆盖层 JSON |
+| `tag` | 否 | 只显示包含该标签的源 |
+| `includeDisabled` | 否 | 是否显示已停用源 |
+
+### `info_fetch`
+
+采集一个指定源。
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `id` | 是 | 源 ID |
+| `sourcesPath` | 否 | 本次使用的覆盖层 JSON |
+| `params` | 否 | 路径参数和查询参数 |
+| `limit` | 否 | 本次调用的条数上限 |
+| `path` | 否 | Markdown 输出目录或文件 |
+| `save` | 否 | 是否写文件，默认 `true` |
+
+### `info_collect`
+
+并行采集多个源。单源失败不会阻止其他源返回结果。
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `sourcesPath` | 否 | 本次使用的覆盖层 JSON |
+| `ids` | 否 | 逗号分隔的源 ID，优先于 `tag` |
+| `tag` | 否 | 按标签选择源 |
+| `params` | 否 | 透传给各源的参数 |
+| `dedupe` | 否 | `none` 或 `title` |
+| `sort` | 否 | `none` 或 `hot` |
+| `limit` | 否 | 汇总后的条数上限 |
+| `path` | 否 | Markdown 输出目录或文件 |
+| `save` | 否 | 是否写文件，默认 `true` |
+
+没有指定 `ids` 和 `tag` 时，采集全部启用源。按标题去重时保留热度较高的条目，并在 `alsoFrom` 中记录其他来源。
+
+### `info_reload`
+
+强制重新读取清单并返回校验结果。
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `sourcesPath` | 否 | 要重新读取的覆盖层 JSON |
+
+文件修改时间或大小变化后，下一次调用通常会自动重载。环境变量变化后可使用该工具强制刷新。
+
+### `info_source_save`
+
+创建、更新或删除覆盖层条目。
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `sourcesPath` | 是 | 要修改的覆盖层 JSON |
+| `id` | 是 | 源 ID |
+| `patch` | 否 | 要写入的字段 |
+| `remove` | 否 | 删除覆盖条目，恢复包内定义 |
+
+更新示例：
+
+```text
+info_source_save(
+  sourcesPath="config/my-sources.json",
+  id="example-feed",
+  patch={"enabled":false}
+)
+```
+
+删除覆盖条目：
+
+```text
+info_source_save(
+  sourcesPath="config/my-sources.json",
+  id="example-feed",
+  remove=true
+)
+```
+
+如果文件不存在，插件会创建文件及父目录。
+
+## 采集结果
+
+统一条目结构：
+
+```json
+{
+  "sourceId": "example-api",
+  "title": "示例标题",
+  "rank": 1,
+  "hot": 12345,
+  "url": "https://example.com/item/1",
+  "originalUrl": "https://origin.example.com/item/1",
+  "origin": "示例来源",
+  "publishedAt": "2026-09-26T04:54:05.000Z",
+  "summary": "内容摘要",
+  "label": "AI",
+  "alsoFrom": ["another-source"]
+}
+```
+
+`sourceId`、`title` 和 `rank` 为必填字段，其余字段均为可选字段。
+
+### Markdown 输出
+
+`info_fetch` 和 `info_collect` 默认写入 Markdown。输出位置优先级：
+
+1. 调用参数 `path`；
+2. 环境变量 `DSH_INFO_OUTPUT_DIR`；
+3. DSH 会话工作区；
+4. `process.cwd()`。
+
+自动文件名为 `info_collection_<YYYYMMDDHHmmss>.md`，时间戳使用北京时间。自动命名不会覆盖现有文件，冲突时增加 `_2`、`_3` 等后缀；显式 `.md` 路径会覆盖目标文件。
+
+```text
+info_fetch(id="aihot-daily", path="collections")
+info_fetch(id="aihot-daily", path="collections/daily.md")
+info_fetch(id="aihot-daily", save=false)
+```
+
+## 错误处理
+
+- HTTP、超时、解析和适配器错误转换为 `ok=false` 结果；
+- 多源采集分别报告每个源的状态、URL 和 HTTP 状态码；
+- 配置校验失败的源不会发送网络请求；
+- 写文件失败通过 `fileError` 返回，不会丢弃采集数据；
+- 无效 JSON、缺失的显式覆盖文件和不支持的清单版本属于清单加载错误。
+
+## 开发与测试
+
+### 稳定测试
+
+```powershell
+npm test
+```
+
+稳定测试不访问公网，覆盖清单合并、配置校验、API 映射、Feed 解析、多源去重和 Markdown 输出。
+
+### 公网冒烟测试
+
+```powershell
+npm run test:live
+```
+
+该命令在稳定测试后访问包内示例源。网络不可用时相关检查显示警告，不会导致失败。
+
+### Harness 解析测试
+
+```powershell
+npm run test:resolve
 node test/bundle-resolution.mjs "C:\Users\<you>\.dsh\profiles\web"
 ```
 
-> 开发期 `node_modules/@deepseek-ai/dsh-tools` 是指向 DSH 自带副本的 junction（已进 `.gitignore`），
-> 用 `npm run dev:link` 重建；`link:` 方式安装时需要它，原因见上面的安装说明。
+### Feed 体检
 
-## 目录结构
-
+```powershell
+node test/check-feeds.mjs https://example.com/feed.xml
 ```
+
+### 导出源快照
+
+```powershell
+node test/dump-source.mjs qbitai-feed "D:\output\qbitai.md"
+```
+
+### 发布前检查
+
+```powershell
+npm test
+npm run test:live
+npm run test:resolve
+npm pack --dry-run
+```
+
+## 扩展采集方式
+
+新增采集方式：
+
+1. 在 `lib/methods/` 下创建适配器；
+2. 在 `lib/methods/index.js` 中注册；
+3. 增加配置校验、成功路径和失败路径测试；
+4. 更新本文档。
+
+适配器接口：
+
+```js
+export const adapter = {
+  id: "example-method",
+  label: "示例采集方式",
+  summary: "采集方式说明",
+  requiredKeys: ["url"],
+
+  async run(source, { signal, params, defaults }) {
+    return {
+      ok: true,
+      status: 200,
+      url: source.url,
+      items: [],
+      rawCount: 0,
+      matchedPath: "example"
+    };
+  }
+};
+```
+
+可以复用以下公共模块：
+
+- `lib/http.js`：HTTP 请求、超时、取消、解码和 URL 组装；
+- `lib/source-util.js`：条数、超时和请求头合并；
+- `lib/select.js`：字段路径读取；
+- `lib/feed.js`：XML、RSS、Atom 和 RDF 解析。
+
+## 项目结构
+
+```text
 dsh-info-sources/
-  package.json           dsh.bundle.patch 指向 cordis.patch.yml；files 决定哪些文件进包
-  cordis.patch.yml       insert 一行挂载插件（就是 dsh 加载的入口行）
-  LICENSE                MIT
-  .gitignore             node_modules / *.tgz / info_collection_*.md
-  config/sources.json    包内示例清单：一个 api-get（aihot-daily）+ 一个 rss（qbitai-feed）
-  lib/index.js           工具层：info_sources / info_fetch / info_collect / info_reload / info_source_save
-  lib/registry.js        清单层：两层合并、校验、$ENV 插值、mtime 热重载、程序化写入、注释块识别
-  lib/output.js          落盘层：info_collection_<时间戳>.md 的命名、目录解析与 markdown 组装
-  lib/select.js          取值路径工具（[] / [n] / 点号路径），api-get 用
-  lib/http.js            公共 HTTP 层：UA 轮换、超时/取消、字符集嗅探、URL 组装（含 {key} 路径参数）
-  lib/source-util.js     公共清单字段：effectiveLimit / effectiveTimeout / mergeHeaders
-  lib/feed.js            零依赖 XML + feed 解析（RSS 2.0 / Atom / RSS 1.0）
-  lib/methods/api-get.js 采集方式适配器：HTTP GET + JSON + 字段映射
-  lib/methods/rss.js     采集方式适配器：RSS / Atom / RDF 订阅源
-  lib/methods/index.js   采集方式注册表
-  scripts/link-dsh-tools.mjs  建立本地开发用的 @deepseek-ai/dsh-tools 解析链接（dev only，不随包发布）
-  test/run.mjs           本地验证：假 ctx + 本地 HTTP 接口 + RSS 解析 + 落盘 + 真接口冒烟
-  test/try.mjs           手动试跑单个工具（默认会落盘，可用 $env:DSH_WORKSPACE 指定会话工作区）
-  test/check-feeds.mjs   加源前体检：批量判断 feed 可用性与字段完整度
-  test/dump-source.mjs   把任意一个源整份导出成 markdown 快照
-  test/bundle-resolution.mjs  按 profile 解析路径复现 harness 的 bundle 加载
+├── config/
+│   └── sources.json          # 包内默认源
+├── lib/
+│   ├── methods/
+│   │   ├── api-get.js        # JSON API 适配器
+│   │   ├── rss.js            # RSS/Atom/RDF 适配器
+│   │   └── index.js          # 适配器注册表
+│   ├── feed.js               # Feed 解析
+│   ├── http.js               # HTTP 公共层
+│   ├── index.js              # DSH 工具入口
+│   ├── output.js             # Markdown 输出
+│   ├── registry.js           # 清单加载、合并和校验
+│   ├── select.js             # 字段路径解析
+│   └── source-util.js        # 通用源参数
+├── scripts/
+│   └── link-dsh-tools.mjs    # 本地开发依赖链接
+├── test/                     # 测试与辅助工具
+├── cordis.patch.yml          # DSH bundle 配置
+└── package.json
 ```
 
-> `test/` 与 `scripts/` 只在开发时用，`package.json` 的 `files` 不含它们，不会被发布出去。
+## 许可证
 
-## License
-
-MIT
+本项目采用 [MIT License](LICENSE)。
