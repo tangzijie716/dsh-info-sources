@@ -340,6 +340,17 @@ const invalidSource = await call("info_fetch", { id: "needs-env", save: false })
 check("配置校验失败的源不会进入适配器", invalidSource.ok === false && invalidSource.error.includes("配置校验未通过"), invalidSource.error);
 const deduped = await call("info_collect", { ids: "dedupe-low,dedupe-high", dedupe: "title", save: false });
 check("高热度条目替换后 alsoFrom 指向旧来源而非自己", deduped.items[0]?.sourceId === "dedupe-high" && JSON.stringify(deduped.items[0]?.alsoFrom) === JSON.stringify(["dedupe-low"]), JSON.stringify(deduped.items[0]));
+
+// 回归：一个源即使没有以自己为主源的条目，只要它参与了跨源合并（进了 alsoFrom），
+// 它在「去重后落盘」里的计数就不能是 0——曾经 countRetainedBySource 漏算 alsoFrom，
+// 于是落盘成了「自报 20 条（去重后落盘 0 条）」，与本源的条目明确出现在正文里自相矛盾。
+const dedupedCountCall = await call("info_collect", { ids: "dedupe-low,dedupe-high", dedupe: "title", path: join(dir, "dedupe-count.md") });
+const dedupeCountBody = readFileSync(dedupedCountCall.file, "utf8");
+const lowLine = dedupeCountBody.match(/- ✓ \*\*去重低热度\*\*.*/)?.[0] ?? "";
+check("参与跨源合并的源，落盘计数不为 0", !lowLine.includes("落盘 0 条"), lowLine);
+check("自报与落盘相等时不加括注", lowLine.includes("：1 条") && !lowLine.includes("去重后落盘"), lowLine);
+// 注：「落盘少于自报时显示括注」与「全源被去重时告警」两个场景由下面直调 writeCollection 的用例覆盖
+// （真实源的 limit 太小，构造不出这两种情形）。
 const collectNone = await call("info_collect", { ids: "nope" });
 check("多源：无匹配源给出提示", collectNone.ok === false && collectNone.note.includes("没有匹配的源"), collectNone.note);
 const collectAi = await call("info_collect", { tag: "ai" });
@@ -495,6 +506,16 @@ const body = readFileSync(fetched.file, "utf8");
 check("markdown 有标题与条目数", body.includes("# 本地嵌套接口（local-nested）采集结果") && body.includes("## 条目（2 条）"), body.split("\n")[0]);
 check("markdown 带来源小节与请求 URL", body.includes("## 来源") && body.includes("/nested?tab=from-config"));
 check("markdown 带出处/原文/摘要", body.includes("- **出处**：来源甲") && body.includes("- **原文**：https://example.com/origin-a") && body.includes("**摘要**：甲的摘要"));
+if (process.env.DEBUG_OUTPUT) {
+  console.log("---- DEBUG body ----");
+  console.log(body);
+  console.log("---- DEBUG item0 ----");
+  console.log(JSON.stringify(fetched.items?.[0], null, 2));
+}
+// 来源（采集源）必须落到每条上：只有开头的「## 来源」小节不足以算覆盖度，
+// 「出处」是媒体名而不是采集源，两者不能互相替代。
+check("markdown 每条带采集源及其 id", body.includes("- **来源**：本地嵌套接口（`local-nested`）"));
+check("采集源排在出处之前", body.indexOf("- **来源**") < body.indexOf("- **出处**"));
 check("markdown 带发布时间与北京时间换算", body.includes("2026-09-26T04:54:05.000Z") && body.includes("北京时间 09-26 12:54"));
 check("渲染文本里给出落盘路径", rendered("info_fetch", { id: "local-nested" }, fetched).includes("已落盘："));
 check("每次取数新增一个文件", readdirSync(outDir).length === before + 1, `${before} → ${readdirSync(outDir).length}`);
@@ -521,6 +542,38 @@ const collected = await call("info_collect", { ids: "local-nested,local-404" });
 const collectBody = typeof collected.file === "string" ? readFileSync(collected.file, "utf8") : "";
 check("汇总也落盘并记录各源成败", collectBody.includes("✓ **本地嵌套接口**") && collectBody.includes("✗ **本地 404**"), String(collected.file));
 check("汇总落盘带来源小节", collectBody.includes("## 来源") && collectBody.includes("## 条目（2 条）"));
+
+// 同源重复副本必须留痕，且「## 来源」小节要同时给出「自报」与「去重后落盘」两个数。
+// 回归：曾经同源重复被 filter 静默吞掉——一条源自报 20 条、正文只有 19 条，毫无痕迹。
+const dupReport = writeCollection({
+  heading: "同源重复", sources: [{ sourceId: "s1", ok: true, count: 20 }, { sourceId: "s2", ok: true, count: 2 }],
+  items: [{ sourceId: "s1", title: "重复标题", duplicates: ["s1"] }, { sourceId: "s2", title: "另一条" }],
+  labelOf: new Map([["s1", "源一"], ["s2", "源二"]]),
+  duplicatesBySource: new Map([["s1", 2], ["s2", 2]]),
+  path: join(dir, "dup.md"),
+});
+const dupBody = readFileSync(dupReport.file, "utf8");
+check("条目渲染「同源重复」", dupBody.includes("- **同源重复**：1 条（`s1`）"), dupBody.match(/- \*\*同源重复\*\*：.*/)?.[0]);
+check("来源小节给出「自报 + 去重后落盘」", dupBody.includes("**源一**（`s1`）：20 条（去重后落盘 2 条）"), dupBody.match(/- ✓ \*\*源一\*\*.*/)?.[0]);
+check("条数一致的源不加多余括注", dupBody.includes("**源二**（`s2`）：2 条") && !dupBody.includes("**源二**（`s2`）：2 条（去重后"));
+
+// 一个源被全部去重掉时要有显式警告，不能只是数字变小
+const goneReport = writeCollection({
+  heading: "全被合并", sources: [{ sourceId: "gone", ok: true, count: 3 }],
+  items: [{ sourceId: "kept", title: "留下的一条" }],
+  labelOf: new Map([["gone", "全被合并的源"], ["kept", "留存源"]]),
+  duplicatesBySource: new Map([["gone", 0], ["kept", 1]]),
+  path: join(dir, "gone.md"),
+});
+const goneBody = readFileSync(goneReport.file, "utf8");
+check("全源被去重时给出显式警告", goneBody.includes("去重后落盘 0 条，全部为重复副本") && goneBody.includes("⚠ 本源的条目全部与其它源重复"), goneBody.match(/- ✓ .*gone.*/)?.[0]);
+
+// 跨源合并的条目：主源写「**来源**」，其余源写「**同题还见于**」并带上 id。
+// 两者合起来才是完整的 feed 覆盖——控制台只显示主源，缺的正是这一半。
+const dedupedSaved = await call("info_collect", { ids: "dedupe-low,dedupe-high", dedupe: "title", path: join(dir, "dedupe.md") });
+const dedupeBody = readFileSync(dedupedSaved.file, "utf8");
+check("合并条目主源写进「来源」", dedupeBody.includes("- **来源**：去重高热度（`dedupe-high`）"), dedupeBody.match(/- \*\*来源\*\*：.*/)?.[0]);
+check("合并条目其余源写进「同题还见于」且带 id", dedupeBody.includes("去重低热度（`dedupe-low`）"), dedupeBody.match(/- \*\*同题还见于\*\*：.*/)?.[0]);
 
 // ── 收尾 ──────────────────────────────────────────────────────────────────
 server.close();
